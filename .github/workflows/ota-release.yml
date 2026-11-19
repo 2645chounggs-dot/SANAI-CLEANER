@@ -1,0 +1,84 @@
+name: SANAI CLEANER policy OTA
+on:
+  push:
+    branches: [main]
+    paths: ['ota/policy.json']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: cleaner-ota
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Validate policy and stable signing
+        id: setup
+        env:
+          KEY: ${{ secrets.CLEANER_KEYSTORE_B64 }}
+          PASSWORD: ${{ secrets.CLEANER_STORE_PASSWORD }}
+          ALIAS: ${{ secrets.CLEANER_KEY_ALIAS }}
+          CERT: ${{ vars.CLEANER_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          p=json.load(open('ota/policy.json'))
+          assert set(p)=={'nativeVersion','revision','thumbnail','workers','prefixBytes'}
+          assert all(type(v) is int for v in p.values())
+          assert p['nativeVersion']==2 and p['revision']>=1
+          assert 160<=p['thumbnail']<=384 and 1<=p['workers']<=3 and 16384<=p['prefixBytes']<=262144
+          PY
+          if [[ -n "$KEY" && -n "$PASSWORD" && -n "$ALIAS" && "$CERT" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Configure stable signing before publishing policy."
+          fi
+      - name: Sign policy with APK key
+        if: steps.setup.outputs.ready == 'true'
+        env:
+          CLEANER_KEYSTORE_B64: ${{ secrets.CLEANER_KEYSTORE_B64 }}
+          CLEANER_STORE_PASSWORD: ${{ secrets.CLEANER_STORE_PASSWORD }}
+          CLEANER_KEY_ALIAS: ${{ secrets.CLEANER_KEY_ALIAS }}
+          EXPECTED_CERT: ${{ vars.CLEANER_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          key="$RUNNER_TEMP/cleaner.p12"
+          pem="$RUNNER_TEMP/cleaner-key.pem"
+          der="$RUNNER_TEMP/cleaner.der"
+          trap 'rm -f "$key" "$pem" "$der" "$RUNNER_TEMP/cleaner-cert.pem"' EXIT
+          printf '%s' "$CLEANER_KEYSTORE_B64" | base64 --decode > "$key"
+          keytool -exportcert -storetype PKCS12 -keystore "$key" -storepass:env CLEANER_STORE_PASSWORD -alias "$CLEANER_KEY_ALIAS" -file "$der"
+          test "$(sha256sum "$der" | cut -d' ' -f1)" = "${EXPECTED_CERT,,}"
+          openssl pkcs12 -in "$key" -nocerts -nodes -passin env:CLEANER_STORE_PASSWORD -out "$pem"
+          openssl x509 -inform DER -in "$der" -out "$RUNNER_TEMP/cleaner-cert.pem"
+          mkdir -p release
+          cp ota/policy.json release/policy.json
+          openssl dgst -sha256 -sign "$pem" -out release/policy.sig release/policy.json
+          openssl dgst -sha256 -verify <(openssl x509 -in "$RUNNER_TEMP/cleaner-cert.pem" -pubkey -noout) -signature release/policy.sig release/policy.json
+      - name: Publish monotonic policy
+        if: steps.setup.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view ota-channel >/dev/null 2>&1; then
+            mkdir -p "$RUNNER_TEMP/current"
+            gh release download ota-channel --pattern policy.json --dir "$RUNNER_TEMP/current"
+            python - "$RUNNER_TEMP/current/policy.json" release/policy.json <<'PY'
+          import json,sys
+          a,b=(json.load(open(p)) for p in sys.argv[1:])
+          assert (b['nativeVersion'],b['revision'])>(a['nativeVersion'],a['revision']), 'Refusing repeated or older policy'
+          PY
+            gh release upload ota-channel release/policy.json release/policy.sig --clobber
+          else
+            gh release create ota-channel release/policy.json release/policy.sig --target "$GITHUB_SHA" --prerelease --latest=false --title "SANAI CLEANER signed policy"
+          fi
