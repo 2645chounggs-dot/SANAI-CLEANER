@@ -1,7 +1,13 @@
 name: Build Android APK
-on: [push, workflow_dispatch]
+on:
+  push:
+    branches: [main, v0.2.0-performance]
+  workflow_dispatch:
 permissions:
   contents: write
+concurrency:
+  group: cleaner-build-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -11,8 +17,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - name: Verify runner Android SDK and required packages
-        shell: bash
+      - name: Android SDK
         run: |
           set -euo pipefail
           sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
@@ -20,18 +25,14 @@ jobs:
           echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
           if [ ! -f "$sdk/platforms/android-35/android.jar" ] || [ ! -x "$sdk/build-tools/35.0.0/apksigner" ]; then
             manager="$sdk/cmdline-tools/latest/bin/sdkmanager"
-            if [ ! -x "$manager" ]; then
-              manager=$(command -v sdkmanager || true)
-            fi
-            test -x "$manager"
+            if [ ! -x "$manager" ]; then manager=$(command -v sdkmanager); fi
             "$manager" --sdk_root="$sdk" 'platforms;android-35' 'build-tools;35.0.0'
           fi
-          test -f "$sdk/platforms/android-35/android.jar"
-          test -x "$sdk/build-tools/35.0.0/apksigner"
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
-      - run: gradle :app:assembleDebug :app:lintDebug --stacktrace
+      - name: Compile and lint
+        run: gradle :app:assembleDebug :app:lintDebug --stacktrace
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -40,13 +41,60 @@ jobs:
           if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:
-          name: SANAI-CLEANER-debug
+          name: SANAI-CLEANER-debug-test-only
           path: app/build/outputs/apk/debug/app-debug.apk
-      - name: Publish test APK
-        if: github.ref == 'refs/heads/main'
+      - name: Check signing setup
+        id: sign
+        env:
+          KEY: ${{ secrets.CLEANER_KEYSTORE_B64 }}
+          PASSWORD: ${{ secrets.CLEANER_STORE_PASSWORD }}
+          ALIAS: ${{ secrets.CLEANER_KEY_ALIAS }}
+          CERT: ${{ vars.CLEANER_CERT_SHA256 }}
+        run: |
+          if [[ -n "$KEY" && -n "$PASSWORD" && -n "$ALIAS" && "$CERT" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Stable signing is not configured. Debug test artifact only; no installable upgrade will be published."
+          fi
+      - name: Build verified signed APK and AAB
+        if: steps.sign.outputs.ready == 'true' && github.ref == 'refs/heads/main'
+        env:
+          CLEANER_KEYSTORE_B64: ${{ secrets.CLEANER_KEYSTORE_B64 }}
+          CLEANER_STORE_PASSWORD: ${{ secrets.CLEANER_STORE_PASSWORD }}
+          CLEANER_KEY_ALIAS: ${{ secrets.CLEANER_KEY_ALIAS }}
+          CLEANER_KEY_PASSWORD: ${{ secrets.CLEANER_KEY_PASSWORD }}
+          EXPECTED_CERT: ${{ vars.CLEANER_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          export CLEANER_KEYSTORE="$RUNNER_TEMP/cleaner.p12"
+          trap 'rm -f "$CLEANER_KEYSTORE" "$RUNNER_TEMP/cleaner.der"' EXIT
+          printf '%s' "$CLEANER_KEYSTORE_B64" | base64 --decode > "$CLEANER_KEYSTORE"
+          keytool -exportcert -storetype PKCS12 -keystore "$CLEANER_KEYSTORE" -storepass:env CLEANER_STORE_PASSWORD -alias "$CLEANER_KEY_ALIAS" -file "$RUNNER_TEMP/cleaner.der"
+          actual=$(sha256sum "$RUNNER_TEMP/cleaner.der" | cut -d' ' -f1)
+          test "$actual" = "${EXPECTED_CERT,,}" || { echo 'Signing certificate mismatch'; exit 1; }
+          gradle :app:assembleRelease :app:bundleRelease
+          mkdir -p release
+          cp app/build/outputs/apk/release/app-release.apk release/SANAI-CLEANER.apk
+          cp app/build/outputs/bundle/release/app-release.aab release/SANAI-CLEANER.aab
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs release/SANAI-CLEANER.apk | tee "$RUNNER_TEMP/cert.txt"
+          grep -qi "certificate SHA-256 digest: $actual" "$RUNNER_TEMP/cert.txt"
+      - uses: actions/upload-artifact@v4
+        if: steps.sign.outputs.ready == 'true' && github.ref == 'refs/heads/main'
+        with:
+          name: SANAI-CLEANER-signed
+          path: release/
+      - name: Publish signed APK
+        if: steps.sign.outputs.ready == 'true' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp app/build/outputs/apk/debug/app-debug.apk SANAI-CLEANER-v0.1.0-alpha.apk
-          tag="v0.1.0-alpha.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
-          gh release create "$tag" SANAI-CLEANER-v0.1.0-alpha.apk --target "$GITHUB_SHA" --prerelease --title "SANAI CLEANER v0.1.0 alpha" --notes "Debug-signed test APK. Build and lint passed. Device testing and stable signing pending. Do not use on important files before testing."
+          set -euo pipefail
+          name=$(sed -nE "s/.*versionName '([^']+)'.*/\1/p" app/build.gradle)
+          test -n "$name"
+          if gh release view "v$name" >/dev/null 2>&1; then
+            echo 'Already published. Bump version for new APK.'
+          else
+            gh release create "v$name" release/SANAI-CLEANER.apk --target "$GITHUB_SHA" --title "사나이청소기 v$name" --notes "Fixed signing; device testing still required. Policy OTA does not install APKs."
+          fi
